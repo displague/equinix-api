@@ -1,0 +1,101 @@
+#!/usr/bin/env zsh -e
+
+
+api_path="$1"
+# default to GET if no method is provided
+api_method="${2:-GET}"
+api_data="$3"
+
+# Usage/help output
+usage() {
+    cat <<EOF
+Usage: equinix-api <api_path> [METHOD] [DATA]
+
+Arguments:
+  <api_path>   The API path, e.g. metal/devices or fabric/v4/connections
+  [METHOD]     HTTP method (default: GET)
+  [DATA]       Data to send (for POST/PUT/PATCH)
+
+Environment variables:
+  PARSER              Parser command (defaults to first found: 'yq -y .', 'jq .', 'cat')
+  METAL_AUTH_TOKEN    Auth token for /metal/ APIs
+  EQUINIX_CLIENT_ID   OAuth client ID (overrides config)
+  EQUINIX_CLIENT_SECRET OAuth client secret (overrides config)
+
+Config files:
+  ~/.config/equinix/equinix.yaml: Contains equinix_client_id, equinix_client_secret, metal_auth_token
+  ~/.config/equinix/metal.yaml: Contains token for /metal/ APIs
+
+Examples:
+  equinix-api ne/v1/metros
+  equinix-api metal/v1/locations/metros
+  equinix-api fabric/v4/connections POST '{"foo": "bar"}'
+
+EOF
+}
+
+# Show help if no args or --help
+if [[ $# -eq 0 || "$1" == "--help" ]]; then
+    usage
+    exit 0
+fi
+
+# If PARSER is supplied as an env variable, use it. Otherwise, try yq, jq, then cat.
+if [[ -n "$PARSER" ]]; then
+    PARSER=(${(z)PARSER})
+else
+    for candidate in 'yq -y .' 'jq .' 'cat'; do
+        set -- ${(z)candidate}
+        if command -v $1 &> /dev/null; then
+            PARSER=($@)
+            break
+        fi
+    done
+fi
+
+# If the API path starts with /metal/, use metal_auth_token or METAL_AUTH_TOKEN, or token from metal.yaml
+if [[ "$api_path" == metal/* || "$api_path" == /metal/* ]]; then
+    # Try env var first
+    if [[ -n "$METAL_AUTH_TOKEN" ]]; then
+        METAL_TOKEN="$METAL_AUTH_TOKEN"
+    else
+        # Try to get from equinix.yaml
+        METAL_TOKEN=$(yq -r '.metal_auth_token // empty' ~/.config/equinix/equinix.yaml)
+        if [[ -z "$METAL_TOKEN" ]]; then
+            # Try to get from metal.yaml as 'token'
+            METAL_TOKEN=$(yq -r '.token // empty' ~/.config/equinix/metal.yaml)
+        fi
+    fi
+    if [[ -z "$METAL_TOKEN" ]]; then
+        echo "Error: metal_auth_token not found in environment, ~/.config/equinix/equinix.yaml, or ~/.config/equinix/metal.yaml" >&2
+        exit 1
+    fi
+    curl -s -X "$api_method" -H "X-Auth-Token: $METAL_TOKEN" https://api.equinix.com/${api_path} -d "$api_data" | "${PARSER[@]}"
+    exit $?
+fi
+
+# Otherwise, use OAuth2
+# Allow env override for client id/secret
+if [[ -n "$EQUINIX_CLIENT_ID" ]]; then
+    CLIENT_ID="$EQUINIX_CLIENT_ID"
+else
+    CLIENT_ID=$(yq -r '.equinix_client_id' ~/.config/equinix/equinix.yaml)
+fi
+if [[ -n "$EQUINIX_CLIENT_SECRET" ]]; then
+    CLIENT_SECRET="$EQUINIX_CLIENT_SECRET"
+else
+    CLIENT_SECRET=$(yq -r '.equinix_client_secret' ~/.config/equinix/equinix.yaml)
+fi
+
+# Exchange the client ID and secret for an access token
+access_token_response=$(curl -s -X POST "https://api.equinix.com/oauth2/v1/token" \
+  -H 'content-type: application/json' \
+  -d "{
+    \"grant_type\": \"client_credentials\",
+    \"client_id\": \"$CLIENT_ID\",
+    \"client_secret\": \"$CLIENT_SECRET\"
+}")
+
+access_token=$(echo $access_token_response | jq -r '.access_token')
+# Make the API request with the access token, supplying the method and path, and data if provided
+curl -s -X "$api_method" -H "Authorization: Bearer $access_token" https://api.equinix.com/${api_path} -d "$api_data" | "${PARSER[@]}"
