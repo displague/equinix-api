@@ -1,4 +1,4 @@
-#!/usr/bin/env bash -e
+#!/usr/bin/env zsh -e
 
 
 api_path="$1"
@@ -8,28 +8,34 @@ api_data="$3"
 
 # Usage/help output
 usage() {
-    cat <<EOF
-Usage: equinix-api <api_path> [METHOD] [DATA]
+        cat <<EOF
+Usage:
+    equinix-api <api_path> [METHOD] [DATA]
+    equinix-api --list <api_prefix>
+    equinix-api --help
 
 Arguments:
-  <api_path>   The API path, e.g. metal/devices or fabric/v4/connections
-  [METHOD]     HTTP method (default: GET)
-  [DATA]       Data to send (for POST/PUT/PATCH)
+    <api_path>   The API path, e.g. metal/devices or fabric/v4/connections
+    [METHOD]     HTTP method (default: GET)
+    [DATA]       Data to send (for POST/PUT/PATCH)
+    --list       List all available methods and paths for an API prefix (e.g. metal/v1)
+    --help       Show this help message
 
 Environment variables:
-  PARSER              Parser command (defaults to first found: 'yq -y .', 'jq .', 'cat')
-  METAL_AUTH_TOKEN    Auth token for /metal/ APIs
-  EQUINIX_CLIENT_ID   OAuth client ID (overrides config)
-  EQUINIX_CLIENT_SECRET OAuth client secret (overrides config)
+    PARSER              Parser command (defaults to first found: 'yq -y .', 'jq .', 'cat')
+    METAL_AUTH_TOKEN    Auth token for /metal/ APIs (overrides config)
+    EQUINIX_CLIENT_ID   OAuth client ID (overrides config)
+    EQUINIX_CLIENT_SECRET OAuth client secret (overrides config)
 
 Config files:
-  ~/.config/equinix/equinix.yaml: Contains equinix_client_id, equinix_client_secret, metal_auth_token
-  ~/.config/equinix/metal.yaml: Contains token for /metal/ APIs
+    ~/.config/equinix/equinix.yaml: Contains equinix_client_id, equinix_client_secret, metal_auth_token
+    ~/.config/equinix/metal.yaml: Contains token for /metal/ APIs
 
 Examples:
-  equinix-api ne/v1/metros
-  equinix-api metal/v1/locations/metros
-  equinix-api fabric/v4/connections POST '{"foo": "bar"}'
+    equinix-api ne/v1/metros
+    equinix-api metal/v1/locations/metros
+    equinix-api fabric/v4/connections POST '{"foo": "bar"}'
+    equinix-api --list metal/v1
 
 EOF
 }
@@ -38,6 +44,40 @@ EOF
 if [[ $# -eq 0 || "$1" == "--help" ]]; then
     usage
     exit 0
+fi
+    
+# --list <prefix> support
+if [[ "$1" == "--list" ]]; then
+    if [[ -z "$2" ]]; then
+        echo "Usage: equinix-api --list <api_prefix>" >&2
+        exit 1
+    fi
+        prefix="$2"
+        # Remove all slashes and join segments (e.g., metal/v1 -> metalv1)
+        prefix_no_slash="${prefix##/}"
+        prefix_flat=$(echo "$prefix_no_slash" | tr -d '/')
+        openapi_url="https://docs.equinix.com/api-catalog/${prefix_flat}/openapi.yaml"
+        if ! command -v yq &>/dev/null; then
+                echo "yq is required for --list" >&2
+                exit 1
+        fi
+        echo "Fetching OpenAPI spec from $openapi_url..." >&2
+        openapi_content=$(curl -s "$openapi_url")
+            # Check if the content looks like YAML (starts with openapi: or swagger:)
+            if ! echo "$openapi_content" | grep -qE '^(openapi:|swagger:)' ; then
+                    echo "Error: The fetched file does not appear to be a valid OpenAPI YAML document." >&2
+                    echo "$openapi_content" | head -20 >&2
+                    exit 2
+            fi
+            # Check if .paths exists and is not null
+            if ! echo "$openapi_content" | yq -e '.paths' >/dev/null 2>&1; then
+                    echo "Error: No .paths found in OpenAPI spec (API may not exist or is not documented)." >&2
+                    exit 5
+            fi
+            # List methods and paths
+                    echo "$openapi_content" | yq -r '
+                        .paths | to_entries[] | .key as $path | .value | to_entries[]? | "\(.key) \($path)"'
+            exit $?
 fi
 
 # If PARSER is supplied as an env variable, use it. Otherwise, try yq, jq, then cat.
