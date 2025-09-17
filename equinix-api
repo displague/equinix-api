@@ -1,6 +1,5 @@
 #!/usr/bin/env zsh -e
 
-
 api_path="$1"
 # default to GET if no method is provided
 api_method="${2:-GET}"
@@ -34,7 +33,7 @@ Config files:
 Examples:
     equinix-api ne/v1/metros
     equinix-api metal/v1/locations/metros
-    equinix-api fabric/v4/connections POST '{"foo": "bar"}'
+    equinix-api /fabric/v4/connections POST '{"foo": "bar"}'
     equinix-api --list metal/v1
 
 EOF

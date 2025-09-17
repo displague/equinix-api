@@ -12,27 +12,33 @@ This project provides a simple shell script for interacting with Equinix APIs. I
 
 ```console
 $ equinix-api --help
-Usage: equinix-api <api_path> [METHOD] [DATA]
+Usage:
+    equinix-api <api_path> [METHOD] [DATA]
+    equinix-api --list <api_prefix>
+    equinix-api --help
 
 Arguments:
-  <api_path>   The API path, e.g. metal/devices or fabric/v4/connections
-  [METHOD]     HTTP method (default: GET)
-  [DATA]       Data to send (for POST/PUT/PATCH)
+    <api_path>   The API path, e.g. metal/devices or fabric/v4/connections
+    [METHOD]     HTTP method (default: GET)
+    [DATA]       Data to send (for POST/PUT/PATCH)
+    --list       List all available methods and paths for an API prefix (e.g. metal/v1)
+    --help       Show this help message
 
 Environment variables:
-  PARSER              Parser command (defaults to first found: 'yq -y .', 'jq .', 'cat')
-  METAL_AUTH_TOKEN    Auth token for /metal/ APIs
-  EQUINIX_CLIENT_ID   OAuth client ID (overrides config)
-  EQUINIX_CLIENT_SECRET OAuth client secret (overrides config)
+    PARSER              Parser command (defaults to first found: 'yq -y .', 'jq .', 'cat')
+    METAL_AUTH_TOKEN    Auth token for /metal/ APIs (overrides config)
+    EQUINIX_CLIENT_ID   OAuth client ID (overrides config)
+    EQUINIX_CLIENT_SECRET OAuth client secret (overrides config)
 
 Config files:
-  ~/.config/equinix/equinix.yaml: Contains equinix_client_id, equinix_client_secret, metal_auth_token
-  ~/.config/equinix/metal.yaml: Contains token for /metal/ APIs
+    ~/.config/equinix/equinix.yaml: Contains equinix_client_id, equinix_client_secret, metal_auth_token
+    ~/.config/equinix/metal.yaml: Contains token for /metal/ APIs
 
 Examples:
-  equinix-api ne/v1/metros
-  equinix-api metal/v1/locations/metros
-  equinix-api fabric/v4/connections POST '{"foo": "bar"}'
+    equinix-api ne/v1/metros
+    equinix-api metal/v1/locations/metros
+    equinix-api /fabric/v4/connections POST '{"foo": "bar"}'
+    equinix-api --list metal/v1
 ```
 
 ## License
