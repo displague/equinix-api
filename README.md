@@ -38,6 +38,7 @@ Examples:
     equinix-api ne/v1/metros
     equinix-api metal/v1/locations/metros
     equinix-api /fabric/v4/connections POST '{"foo": "bar"}'
+    equinix-api '/colocations/v2/locations?permissionCode=WORK_VISIT'
     equinix-api --list metal/v1
 ```
 
