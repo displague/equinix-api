@@ -138,4 +138,4 @@ access_token_response=$(curl -s -X POST "https://api.equinix.com/oauth2/v1/token
 
 access_token=$(echo $access_token_response | jq -r '.access_token')
 # Make the API request with the access token, supplying the method and path, and data if provided
-curl -s -X "$api_method" -H "Authorization: Bearer $access_token" https://api.equinix.com/${api_path} -d "$api_data" | "${PARSER[@]}"
+curl --no-progress-meter -X "$api_method" -H "Content-type: application/json" -H "Authorization: Bearer $access_token" https://api.equinix.com/${api_path} -d "$api_data" | "${PARSER[@]}"
