@@ -55,7 +55,44 @@ if [[ $# -eq 0 || "$1" == "--help" ]]; then
     exit 0
 fi
     
-# --list <prefix> support
+fetch_oauth_token() {
+    # First, try environment variables
+    local cid="${EQUINIX_CLIENT_ID:-}"
+    local secret="${EQUINIX_CLIENT_SECRET:-}"
+
+    # If not in env, try the config file
+    if [[ -z "$cid" && -f ~/.config/equinix/equinix.yaml ]]; then
+        cid=$(yq -r '.equinix_client_id // empty' ~/.config/equinix/equinix.yaml 2>/dev/null || true)
+    fi
+    if [[ -z "$secret" && -f ~/.config/equinix/equinix.yaml ]]; then
+        secret=$(yq -r '.equinix_client_secret // empty' ~/.config/equinix/equinix.yaml 2>/dev/null || true)
+    fi
+
+    # If still not found, error out
+    if [[ -z "$cid" || -z "$secret" ]]; then
+        echo "Error: EQUINIX_CLIENT_ID and EQUINIX_CLIENT_SECRET must be set or configured in ~/.config/equinix/equinix.yaml" >&2
+        return 1
+    fi
+
+    local resp
+    resp=$(curl -s -X POST "https://api.equinix.com/oauth2/v1/token" \
+        -H 'Content-Type: application/x-www-form-urlencoded' \
+        -d "grant_type=client_credentials&client_id=${cid}&client_secret=${secret}")
+    local token
+    token=$(echo "$resp" | jq -r '.access_token // empty')
+    local user
+    user_name=$(echo "$resp" | jq -r '.user_name // empty')
+    echo "Accessing API as user: $user_name" >&2
+
+    if [[ -z "$token" || "$token" == "null" ]]; then
+        echo "Error: failed to obtain access token from https://api.equinix.com/oauth2/v1/token" >&2
+        echo "Response was likely empty or invalid. Raw response:" >&2
+        echo "$resp" >&2
+        return 1
+    fi
+    echo "$token"
+}
+
 if [[ "$1" == "--list" ]]; then
     if [[ -z "$2" ]]; then
         echo "Usage: equinix-api --list <api_prefix>" >&2
@@ -102,6 +139,18 @@ else
     done
 fi
 
+# Resolve client id/secret once (env overrides config)
+if [[ -n "$EQUINIX_CLIENT_ID" ]]; then
+    CLIENT_ID="$EQUINIX_CLIENT_ID"
+else
+    CLIENT_ID=$(yq -r '.equinix_client_id // empty' ~/.config/equinix/equinix.yaml 2>/dev/null || true)
+fi
+if [[ -n "$EQUINIX_CLIENT_SECRET" ]]; then
+    CLIENT_SECRET="$EQUINIX_CLIENT_SECRET"
+else
+    CLIENT_SECRET=$(yq -r '.equinix_client_secret // empty' ~/.config/equinix/equinix.yaml 2>/dev/null || true)
+fi
+
 BASE_URL="https://api.equinix.com"
 # Prepare auth headers variable (array) and base URL based on mode
 AUTH_HEADERS=()
@@ -119,9 +168,26 @@ if [[ -n "$PORTAL" ]]; then
         fi
     fi
 
+    # TODO: how to get a JWT BearerToken and RefreshToken if no cookie is provided?
     if [[ -z "$PORTAL_COOKIE" ]]; then
-        echo "Error: portal cookie not found in environment or ~/.config/equinix/equinix.yaml (equinix_portal_cookie)" >&2
-        exit 1
+            # Portal Cookie must contain: BearerToken and RefreshToken
+            echo "No portal cookie found in env/config; attempting to acquire cookie name 'BearerToken' via OAuth token..." >&2
+
+            access_token=$(fetch_oauth_token 2>/dev/null || true)
+            if [[ -n "$access_token" ]]; then
+                echo "Using OAuth access token as portal cookie (BearerToken)" >&2
+                # BearerToken is expected to be a JWT of the format: xxx.yyy.zzz
+                # xxx is the base64 encoded JSON header: {"alg":"RS256","typ":"JWT","kid":"_abc123-_abc123"}
+                # yyy is the base64 encoded JSON payload:
+                # - Standard fields: iss, sub, aud, iat, exp, scope, azp
+                # - webappatm_ prefixed fields: userkey, orgid, username, rootorgid, rootenabled, locale, lastname, providerid, status, workphone, role, firstname, email
+                # - additional fields:  https://auth.equinix.com/federated_login, https://auth.equinix.com/session_id, https://auth.equinix.com/connection
+                # zzz is a signature
+                PORTAL_COOKIE="BearerToken=${access_token}; RefreshToken=;"
+            else
+                echo "Error: OAuth token fetch failed; cannot acquire portal cookie" >&2
+                exit 1
+            fi
     fi
 
     BASE_URL="https://portal.equinix.com/api"
@@ -165,19 +231,12 @@ else
 fi
 
 if [[ ${#AUTH_HEADERS[@]} -eq 0 ]]; then
-        # No auth headers set yet: perform OAuth token exchange and set Authorization header
-        # Use application/x-www-form-urlencoded which the token endpoint expects
-        access_token_response=$(curl -s -X POST "https://api.equinix.com/oauth2/v1/token" \
-            -H 'Content-Type: application/x-www-form-urlencoded' \
-            -d "grant_type=client_credentials&client_id=${CLIENT_ID}&client_secret=${CLIENT_SECRET}")
-        access_token=$(echo "$access_token_response" | jq -r '.access_token // empty')
-        if [[ -z "$access_token" || "$access_token" == "null" ]]; then
-            echo "Error: failed to obtain access token from https://api.equinix.com/oauth2/v1/token" >&2
-            echo "Response was:" >&2
-            echo "$access_token_response" >&2
-            exit 1
-        fi
-        AUTH_HEADERS+=( -H "Authorization: Bearer $access_token" )
+    access_token=$(fetch_oauth_token)
+    if [[ -z "$access_token" ]]; then
+        # Error message is handled in fetch_oauth_token
+        exit 1
+    fi
+    AUTH_HEADERS+=( -H "Authorization: Bearer $access_token" )
 fi
 
 curl --show-error --no-progress-meter -s -X "$api_method" -H "Content-type: application/json" "${(@)AUTH_HEADERS}" "$BASE_URL/${api_path}" -d "$api_data" | "${PARSER[@]}"
