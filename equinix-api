@@ -96,20 +96,55 @@ get_cookie() {
 
     # Poll until cookie is set via DevTools HTTP endpoints (best-effort)
     local cookie_value=""
-    while [ -z "$cookie_value" ]; do
-        # Query list of targets then ask each for cookies via /json/version or websocket - this is a best-effort approach
-        cookie_value=$(curl -s "http://localhost:$port/json" 2>/dev/null \
-            | yq -r '.[].webSocketDebuggerUrl? as $w | ""' 2>/dev/null || true)
-        # Try the older /json endpoint for pages and look for cookies via protocol (best-effort; may fail on some installs)
-        # Try the newer Storage.getCookies first (recommended), fall back to Network.getAllCookies for older backends
-        cookie_value=$(curl -s -H "Content-Type: application/json" --data '{"id":1,"method":"Storage.getCookies"}' "http://localhost:$port/json/protocol" 2>/dev/null \
-            | yq -r ".result.cookies[]? | select(.name==\"$cookie_name\") | .value" 2>/dev/null || true)
-        if [[ -z "$cookie_value" ]]; then
+        # First, try documented HTTP endpoints for the specific target (best-effort)
+        # Find the page target that matches portal.equinix.com
+        local targets_json
+        targets_json=$(curl -s "http://localhost:$port/json" 2>/dev/null || true)
+        local target_id
+        if [[ -n "$targets_json" ]]; then
+            target_id=$(echo "$targets_json" | yq -r '.[] | select(.url | test("portal.equinix.com")) | .id' 2>/dev/null || true)
+        fi
+
+        if [[ -n "$target_id" ]]; then
+            # Try target-specific HTTP protocol bridge if available
+            local try_urls=("http://localhost:$port/devtools/page/$target_id/protocol" "http://localhost:$port/json/protocol")
+            for pu in "${try_urls[@]}"; do
+                cookie_value=$(curl -s -H "Content-Type: application/json" --data '{"id":1,"method":"Storage.getCookies"}' "$pu" 2>/dev/null \
+                    | yq -r ".result.cookies[]? | select(.name==\"$cookie_name\") | .value" 2>/dev/null || true)
+                if [[ -n "$cookie_value" ]]; then
+                    break
+                fi
+                cookie_value=$(curl -s -H "Content-Type: application/json" --data '{"id":1,"method":"Network.getAllCookies"}' "$pu" 2>/dev/null \
+                    | yq -r ".result.cookies[]? | select(.name==\"$cookie_name\") | .value" 2>/dev/null || true)
+                if [[ -n "$cookie_value" ]]; then
+                    break
+                fi
+            done
+        fi
+
+        # If the HTTP bridge didn't return a cookie, fall back to websocket methods (existing best-effort)
+        while [ -z "$cookie_value" ]; do
+            # Try to use any available simple HTTP bridge at /json/protocol
+            cookie_value=$(curl -s -H "Content-Type: application/json" --data '{"id":1,"method":"Storage.getCookies"}' "http://localhost:$port/json/protocol" 2>/dev/null \
+                | yq -r ".result.cookies[]? | select(.name==\"$cookie_name\") | .value" 2>/dev/null || true)
+            if [[ -n "$cookie_value" ]]; then
+                break
+            fi
             cookie_value=$(curl -s -H "Content-Type: application/json" --data '{"id":1,"method":"Network.getAllCookies"}' "http://localhost:$port/json/protocol" 2>/dev/null \
                 | yq -r ".result.cookies[]? | select(.name==\"$cookie_name\") | .value" 2>/dev/null || true)
-        fi
-        sleep 2
-    done
+
+            # If still not found, try websocat if available
+            if [[ -z "$cookie_value" && $(command -v websocat 2>/dev/null) ]]; then
+                cookie_value=$(printf '%s' '{"id":1,"method":"Storage.getCookies"}' \
+                    | websocat - ws://localhost:$port/devtools/page/$target_id 2>/dev/null \
+                    | yq -r ".result.cookies[]? | select(.name==\"$cookie_name\") | .value" 2>/dev/null || true)
+            fi
+
+            # If still not found, break to allow manual fallback in caller
+            if [[ -z "$cookie_value" ]]; then
+                sleep 2
+            fi
+        done
 
     echo "Cookie [$cookie_name] acquired: $cookie_value" >&2
 
