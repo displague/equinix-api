@@ -1,5 +1,11 @@
 #!/usr/bin/env zsh -e
 
+# Support leading --portal flag to use portal.equinix.com with a cookie instead of OAuth
+if [[ "$1" == "--portal" ]]; then
+    PORTAL=1
+    shift
+fi
+
 api_path="$1"
 # default to GET if no method is provided
 api_method="${2:-GET}"
@@ -17,6 +23,7 @@ Arguments:
     <api_path>   The API path, e.g. metal/devices or fabric/v4/connections
     [METHOD]     HTTP method (default: GET)
     [DATA]       Data to send (for POST/PUT/PATCH)
+    --portal     Use portal.equinix.com using a temporary portal cookie
     --list       List all available methods and paths for an API prefix (e.g. metal/v1)
     --help       Show this help message
 
@@ -25,9 +32,10 @@ Environment variables:
     METAL_AUTH_TOKEN    Auth token for /metal/ APIs (overrides config)
     EQUINIX_CLIENT_ID   OAuth client ID (overrides config)
     EQUINIX_CLIENT_SECRET OAuth client secret (overrides config)
+    EQUINIX_PORTAL_COOKIE Cookie string to use when --portal is specified (overrides config)
 
 Config files:
-    ~/.config/equinix/equinix.yaml: Contains equinix_client_id, equinix_client_secret, metal_auth_token
+    ~/.config/equinix/equinix.yaml: Contains equinix_client_id, equinix_client_secret, metal_auth_token, equinix_portal_cookie
     ~/.config/equinix/metal.yaml: Contains token for /metal/ APIs
 
 Examples:
@@ -36,6 +44,7 @@ Examples:
     equinix-api /fabric/v4/connections POST '{"foo": "bar"}'
     equinix-api '/colocations/v2/locations?permissionCode=WORK_VISIT'
     equinix-api --list metal/v1
+    equinix-api --portal v1/users/user@example.com
 
 EOF
 }
@@ -93,16 +102,43 @@ else
     done
 fi
 
+BASE_URL="https://api.equinix.com"
+# Prepare auth headers variable (array) and base URL based on mode
+AUTH_HEADERS=()
+
+# If portal mode is enabled, resolve the portal cookie (env or config) and set Cookie header and base URL
+if [[ -n "$PORTAL" ]]; then
+    if [[ -n "$EQUINIX_PORTAL_COOKIE" ]]; then
+        PORTAL_COOKIE="$EQUINIX_PORTAL_COOKIE"
+    else
+        if command -v yq &>/dev/null; then
+            PORTAL_COOKIE=$(yq -r '.equinix_portal_cookie // empty' ~/.config/equinix/equinix.yaml)
+        else
+            echo "Error: EQUINIX_PORTAL_COOKIE not set and yq not available to read ~/.config/equinix/equinix.yaml" >&2
+            exit 1
+        fi
+    fi
+
+    if [[ -z "$PORTAL_COOKIE" ]]; then
+        echo "Error: portal cookie not found in environment or ~/.config/equinix/equinix.yaml (equinix_portal_cookie)" >&2
+        exit 1
+    fi
+
+    BASE_URL="https://portal.equinix.com/api"
+    AUTH_HEADERS+=( -H "Cookie: $PORTAL_COOKIE" )
+    # Some portal endpoints expect a Referer header
+    AUTH_HEADERS+=( -H "Referer: https://portal.equinix.com/" )
+    AUTH_HEADERS+=( -H "User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.6 Safari/605.1.15" )
+fi
+
 # If the API path starts with /metal/, use metal_auth_token or METAL_AUTH_TOKEN, or token from metal.yaml
 if [[ "$api_path" == metal/* || "$api_path" == /metal/* ]]; then
-    # Try env var first
+    # Resolve metal token (env first, then config files)
     if [[ -n "$METAL_AUTH_TOKEN" ]]; then
         METAL_TOKEN="$METAL_AUTH_TOKEN"
     else
-        # Try to get from equinix.yaml
         METAL_TOKEN=$(yq -r '.metal_auth_token // empty' ~/.config/equinix/equinix.yaml)
         if [[ -z "$METAL_TOKEN" ]]; then
-            # Try to get from metal.yaml as 'token'
             METAL_TOKEN=$(yq -r '.token // empty' ~/.config/equinix/metal.yaml)
         fi
     fi
@@ -110,8 +146,9 @@ if [[ "$api_path" == metal/* || "$api_path" == /metal/* ]]; then
         echo "Error: metal_auth_token not found in environment, ~/.config/equinix/equinix.yaml, or ~/.config/equinix/metal.yaml" >&2
         exit 1
     fi
-    curl -s -X "$api_method" -H "X-Auth-Token: $METAL_TOKEN" https://api.equinix.com/${api_path} -d "$api_data" | "${PARSER[@]}"
-    exit $?
+    AUTH_HEADERS+=( -H "X-Auth-Token: $METAL_TOKEN" )
+    # metal APIs use the standard api base URL
+    BASE_URL="https://api.equinix.com"
 fi
 
 # Otherwise, use OAuth2
@@ -127,15 +164,20 @@ else
     CLIENT_SECRET=$(yq -r '.equinix_client_secret' ~/.config/equinix/equinix.yaml)
 fi
 
-# Exchange the client ID and secret for an access token
-access_token_response=$(curl -s -X POST "https://api.equinix.com/oauth2/v1/token" \
-  -H 'content-type: application/json' \
-  -d "{
-    \"grant_type\": \"client_credentials\",
-    \"client_id\": \"$CLIENT_ID\",
-    \"client_secret\": \"$CLIENT_SECRET\"
-}")
+if [[ ${#AUTH_HEADERS[@]} -eq 0 ]]; then
+        # No auth headers set yet: perform OAuth token exchange and set Authorization header
+        # Use application/x-www-form-urlencoded which the token endpoint expects
+        access_token_response=$(curl -s -X POST "https://api.equinix.com/oauth2/v1/token" \
+            -H 'Content-Type: application/x-www-form-urlencoded' \
+            -d "grant_type=client_credentials&client_id=${CLIENT_ID}&client_secret=${CLIENT_SECRET}")
+        access_token=$(echo "$access_token_response" | jq -r '.access_token // empty')
+        if [[ -z "$access_token" || "$access_token" == "null" ]]; then
+            echo "Error: failed to obtain access token from https://api.equinix.com/oauth2/v1/token" >&2
+            echo "Response was:" >&2
+            echo "$access_token_response" >&2
+            exit 1
+        fi
+        AUTH_HEADERS+=( -H "Authorization: Bearer $access_token" )
+fi
 
-access_token=$(echo $access_token_response | jq -r '.access_token')
-# Make the API request with the access token, supplying the method and path, and data if provided
-curl --no-progress-meter -X "$api_method" -H "Content-type: application/json" -H "Authorization: Bearer $access_token" https://api.equinix.com/${api_path} -d "$api_data" | "${PARSER[@]}"
+curl --show-error --no-progress-meter -s -X "$api_method" -H "Content-type: application/json" "${(@)AUTH_HEADERS}" "$BASE_URL/${api_path}" -d "$api_data" | "${PARSER[@]}"
