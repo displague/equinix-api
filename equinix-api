@@ -11,6 +11,7 @@ api_path="$1"
 api_method="${2:-GET}"
 api_data="$3"
 
+
 # Usage/help output
 usage() {
         cat <<EOF
@@ -33,9 +34,10 @@ Environment variables:
     EQUINIX_CLIENT_ID   OAuth client ID (overrides config)
     EQUINIX_CLIENT_SECRET OAuth client secret (overrides config)
     EQUINIX_PORTAL_COOKIE Cookie string to use when --portal is specified (overrides config)
+    EQUINIX_PORTAL_COOKIE_NAME Optional cookie name to fetch via get_cookie when no cookie is present (default: BearerToken)
 
 Config files:
-    ~/.config/equinix/equinix.yaml: Contains equinix_client_id, equinix_client_secret, metal_auth_token, equinix_portal_cookie
+    ~/.config/equinix/equinix.yaml: Contains equinix_client_id, equinix_client_secret, metal_auth_token, equinix_portal_cookie, equinix_portal_cookie_name
     ~/.config/equinix/metal.yaml: Contains token for /metal/ APIs
 
 Examples:
@@ -47,6 +49,80 @@ Examples:
     equinix-api --portal v1/users/user@example.com
 
 EOF
+}
+
+
+# get_cookie <url> <cookie_name>
+get_cookie() {
+    local url="$1"
+    local cookie_name="$2"
+    local port=9222
+    local tmpdir
+    local browser_pid=
+
+    # Try to find an installed Chrome/Chromium executable
+    local chrome_exec=""
+    for c in google-chrome google-chrome-stable chromium chromium-browser chrome; do
+        if command -v "$c" >/dev/null 2>&1; then
+            chrome_exec="$c"
+            break
+        fi
+    done
+
+    # On macOS, try opening the Google Chrome app with remote debugging if the binary isn't on PATH
+    if [[ -z "$chrome_exec" && -d "/Applications/Google Chrome.app" ]]; then
+        tmpdir=$(mktemp -d)
+        open -a "Google Chrome" --args --remote-debugging-port=$port --user-data-dir="$tmpdir" "$url" &
+        browser_pid=$!
+    elif [[ -n "$chrome_exec" ]]; then
+        tmpdir=$(mktemp -d)
+        "$chrome_exec" --remote-debugging-port=$port --user-data-dir="$tmpdir" "$url" &
+        browser_pid=$!
+    else
+        # Generic fallback: open the URL in the user's default browser and ask them to paste the cookie
+        echo "No Chrome/Chromium executable found. Opening the URL in your default browser and asking for manual cookie input." >&2
+        open "$url"
+        echo
+        echo "Please log in to the portal at: $url" >&2
+        echo "After login, open your browser's developer tools, locate the cookie named '$cookie_name', and paste its value here:" >&2
+        printf "%s" "$cookie_name value: "
+        read -r cookie_value
+        echo "$cookie_value"
+        return 0
+    fi
+
+    echo "Browser started (pid=$browser_pid), please log in to: $url" >&2
+    echo "Waiting for cookie: $cookie_name (DevTools port: $port)" >&2
+
+    # Poll until cookie is set via DevTools HTTP endpoints (best-effort)
+    local cookie_value=""
+    while [ -z "$cookie_value" ]; do
+        # Query list of targets then ask each for cookies via /json/version or websocket - this is a best-effort approach
+        cookie_value=$(curl -s "http://localhost:$port/json" 2>/dev/null \
+            | yq -r '.[].webSocketDebuggerUrl? as $w | ""' 2>/dev/null || true)
+        # Try the older /json endpoint for pages and look for cookies via protocol (best-effort; may fail on some installs)
+        # Try the newer Storage.getCookies first (recommended), fall back to Network.getAllCookies for older backends
+        cookie_value=$(curl -s -H "Content-Type: application/json" --data '{"id":1,"method":"Storage.getCookies"}' "http://localhost:$port/json/protocol" 2>/dev/null \
+            | yq -r ".result.cookies[]? | select(.name==\"$cookie_name\") | .value" 2>/dev/null || true)
+        if [[ -z "$cookie_value" ]]; then
+            cookie_value=$(curl -s -H "Content-Type: application/json" --data '{"id":1,"method":"Network.getAllCookies"}' "http://localhost:$port/json/protocol" 2>/dev/null \
+                | yq -r ".result.cookies[]? | select(.name==\"$cookie_name\") | .value" 2>/dev/null || true)
+        fi
+        sleep 2
+    done
+
+    echo "Cookie [$cookie_name] acquired: $cookie_value" >&2
+
+    # Cleanup browser if we started it
+    if [[ -n "$browser_pid" ]]; then
+        kill "$browser_pid" >/dev/null 2>&1 || true
+    fi
+    if [[ -n "$tmpdir" ]]; then
+        rm -rf "$tmpdir" || true
+    fi
+
+    # Return just the value
+    echo "$cookie_value"
 }
 
 # Show help if no args or --help
@@ -113,14 +189,25 @@ if [[ -n "$PORTAL" ]]; then
     else
         if command -v yq &>/dev/null; then
             PORTAL_COOKIE=$(yq -r '.equinix_portal_cookie // empty' ~/.config/equinix/equinix.yaml)
+            if [[ -z "$PORTAL_COOKIE" ]]; then
+                # Try to acquire cookie interactively via get_cookie
+                COOKIE_NAME="${EQUINIX_PORTAL_COOKIE_NAME:-}"
+                if [[ -z "$COOKIE_NAME" ]]; then
+                    COOKIE_NAME=$(yq -r '.equinix_portal_cookie_name // empty' ~/.config/equinix/equinix.yaml)
+                fi
+                COOKIE_NAME=${COOKIE_NAME:-BearerToken}
+                echo "No portal cookie found in env/config; attempting to acquire cookie name '$COOKIE_NAME' via get_cookie..." >&2
+                PORTAL_COOKIE=$(get_cookie "https://portal.equinix.com/" "$COOKIE_NAME")
+            fi
         else
-            echo "Error: EQUINIX_PORTAL_COOKIE not set and yq not available to read ~/.config/equinix/equinix.yaml" >&2
-            exit 1
+            echo "EQUINIX_PORTAL_COOKIE not set and yq not available to read ~/.config/equinix/equinix.yaml; attempting to acquire cookie via get_cookie..." >&2
+            COOKIE_NAME=${EQUINIX_PORTAL_COOKIE_NAME:-BearerToken}
+            PORTAL_COOKIE=$(get_cookie "https://portal.equinix.com/" "$COOKIE_NAME")
         fi
     fi
 
     if [[ -z "$PORTAL_COOKIE" ]]; then
-        echo "Error: portal cookie not found in environment or ~/.config/equinix/equinix.yaml (equinix_portal_cookie)" >&2
+        echo "Error: portal cookie not found in environment, config, or via get_cookie" >&2
         exit 1
     fi
 
